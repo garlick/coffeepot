@@ -14,23 +14,40 @@ import urwid
 import serial
 from collections import deque
 import time
+import argparse
 
 
 class Scale:
     """
-    Manage the Avery-Berkel 6702-16658 bench scale in ECR mode.
+    Manage the Avery-Berkel 6702-16658 bench scale in ECR (default) mode.
+
+    Call the poll() method to query the scale over serial link.
+    This operation, completed synchronously,  may take a few microseconds
+    and thus affect responsiveness of urwid event loop.
+
+    The poll() might return a scale reading, or it might only return
+    status bits, for example if the scale reading is not yet stable.
+    If it only returned status bits, the weight_is_valid property
+    will be False after poll() returns.
+
+    The weight (in grams) may be obtained via the weight property,
+    with the caveat that it does not reflect the current weight if
+    weight_is_valid is False.
+
+    Urwid text (a color, text tuple) for the scale pop-up window is
+    obtained via the display property.  The display is altered depending
+    on the status bits, for example when unstable, the most recent valid
+    weight is displayed "greyed out", or if under/over scale capacity,
+    the word "over" or "under" is displayed in red.
     """
 
-    path_serial = "/dev/ttyAMA0"
-
-    def __init__(self):
+    def __init__(self, path_serial):
         self._weight = 0.0
         self._weight_is_valid = False
         self.ecr_status = None
-        self.tare_offset = 0.0
 
         self.ser = serial.Serial()
-        self.ser.port = self.path_serial
+        self.ser.port = path_serial
         self.ser.baudrate = 9600
         self.ser.timeout = 0.25
         self.ser.parity = serial.PARITY_EVEN
@@ -83,10 +100,6 @@ class Scale:
             self.ecr_set_status(response)
             self._weight_is_valid = False
 
-    def tare(self):
-        """Incorporate weight of container on scale into future measurements"""
-        self.tare_offset = self._weight
-
     @property
     def at_zero(self):
         """
@@ -105,9 +118,9 @@ class Scale:
         Show red over/under on scale range error.
         """
         if self._weight_is_valid:
-            return ("green", "{:.0f}g".format(self._weight - self.tare_offset))
+            return ("green", "{:.0f}g".format(self._weight))
         elif self.ecr_status == b"10" or self.ecr_status == b"30":  # moving
-            return ("deselect", "{:.0f}g".format(self._weight - self.tare_offset))
+            return ("deselect", "{:.0f}g".format(self._weight))
         elif self.ecr_status == b"01" or self.ecr_status == b"11":
             return ("red", "under")
         elif self.ecr_status == b"02":
@@ -122,8 +135,8 @@ class Scale:
 
     @property
     def weight(self):
-        """Return most recently measured weight, less tare offset if any."""
-        return self._weight - self.tare_offset
+        """Return most recently measured weight."""
+        return self._weight
 
 
 # For testing UI without scale present
@@ -136,7 +149,6 @@ class NoScale(Scale):
         self._weight = 0.0
         self._weight_is_valid = True
         self.ecr_status = None
-        self.tare_offset = 0.0
         return
 
     def poll(self):
@@ -161,12 +173,30 @@ class Progress_mL(urwid.ProgressBar):
 
 
 class DisplayHelper:
+    """
+    Contain Brewcop's urwid display layout and reactor loop.
+    Brewcop should call run() to enter reactor, registering
+    it's tick() callback to run periodically.
+
+    The display has two modes: offline and online, selectable
+    by calling methods offline() and online().  Online mode
+    displays a progress bar.  Offline mode displays meter
+    "pop-up" and a footer message about being offline.
+
+    Progress bar may be updated by calling progress() method.
+
+    Meter reading may be updated by setting the meter property.
+
+    Header center and right regions may be updated by setting
+    the headC and headR properties, respectively.
+
+    Force a screen redraw with redraw() method.
+    """
 
     """
     Urwid color palette.
     Tuples of (Key, font color, background color)
     """
-
     palette = [
         ("background", "dark blue", ""),
         ("deselect", "dark gray", ""),
@@ -206,7 +236,7 @@ jgs \""--..__                              __..--""/
                       `"""----"""`
 '''
 
-    def __init__(self, pot_capacity_mL=100):
+    def __init__(self, pot_capacity_mL):
         # header
         headL = urwid.Text(("green", "B R E W C O P"), align="left")
         self._headC = urwid.Text("", align="center")
@@ -242,6 +272,8 @@ jgs \""--..__                              __..--""/
             self.layout, self.palette, unhandled_input=self.handle_input
         )
 
+        self._online = False
+
     def handle_input(self, key):
         """
         urwid's event loop calls this function on keyboard events
@@ -255,16 +287,16 @@ jgs \""--..__                              __..--""/
         urwid timer callback to run registered "tick" function periodically.
         """
         self.ticker()
-        _loop.set_alarm_in(self.tick_period, self.tick_wrap)
+        _loop.set_alarm_in(self.tick_period_s, self.tick_wrap)
 
-    def run(self, ticker, tick_period):
+    def run(self, ticker, tick_period_s):
         """
-        Register ticker callable, to run every tick_period seconds.
+        Register ticker callable, to run every tick_period_s seconds.
         Start urwid's main loop.
         This method does not return until loop exits (press q).
         """
         self.ticker = ticker
-        self.tick_period = tick_period
+        self.tick_period_s = tick_period_s
         self.main_loop.set_alarm_in(0, self.tick_wrap)
         self.main_loop.run()
 
@@ -307,13 +339,17 @@ jgs \""--..__                              __..--""/
 
     def online(self):
         """Set online display mode (show background + footer progress bar)"""
-        self.layout.body = self.background
-        self.layout.footer = self.pbar
+        if not self._online:
+            self.layout.body = self.background
+            self.layout.footer = self.pbar
+            self._online = True
 
     def offline(self):
         """Set offline display mode (show meter + footer message)"""
-        self.layout.body = self.meterbody
-        self.layout.footer = self.footmsg
+        if self._online:
+            self.layout.body = self.meterbody
+            self.layout.footer = self.footmsg
+            self._online = False
 
     def progress(self, value):
         """Update progress bar value (pot contents in mL)"""
@@ -332,13 +368,10 @@ class Brains:
     empty - scale readings are stable/decreasing and pot content is low
     """
 
-    """Retain scale samples for history_length seconds"""
-    history_length = 30
-
-    def __init__(self, tick_period=1, empty_thresh=0, stale_thresh=60 * 60 * 8):
-        self.history = deque(maxlen=int(self.history_length / tick_period))
-        self.pot_empty_thresh_g = empty_thresh
-        self.stale_thresh = stale_thresh
+    def __init__(self, tick_period_s, empty_thresh_g, stale_thresh_s, history_length_s):
+        self.history = deque(maxlen=int(history_length_s / tick_period_s))
+        self.pot_empty_thresh_g = empty_thresh_g
+        self.stale_thresh_s = stale_thresh_s
         self.state = "unknown"
         self.timestamp = 0
 
@@ -397,7 +430,7 @@ class Brains:
         timestr = self.timestr(t)
         if self.state == "brewing":
             return ("red", "Brewing, elapsed: {}".format(timestr))
-        elif self.state == "ready" and t < self.stale_thresh:
+        elif self.state == "ready" and t < self.stale_thresh_s:
             return ("green", "Ready, elapsed: {}".format(timestr))
         elif self.state == "ready":
             return ("red", "Ready, elapsed: {} (stale)".format(timestr))
@@ -412,47 +445,27 @@ class Brewcop:
     Main Brewcop class.
     """
 
-    tick_period = 0.5
+    def __init__(
+        self,
+        path_serial,
+        pot_capacity_mL,
+        pot_tare_g,
+        pot_empty_thresh_g,
+        stale_thresh_s,
+        tick_period_s,
+        history_length_s,
+    ):
 
-    """Values for Technivorm Moccamaster insulated carafe"""
-    pot_tare_g = 796
-    pot_capacity_g = 1250  # 1g per mL H20
-    pot_empty_thresh_g = 50
-
-    """Declare coffee stale after 4h"""
-    stale_thresh = 60 * 60 * 4
-
-    def __init__(self):
         try:
-            self.scale = Scale()
+            self.scale = Scale(path_serial)
         except:
             self.scale = NoScale()
-        self.disp = DisplayHelper(pot_capacity_mL=self.pot_capacity_g)
+        self.disp = DisplayHelper(pot_capacity_mL)
         self.brains = Brains(
-            tick_period=self.tick_period,
-            empty_thresh=self.pot_empty_thresh_g,
-            stale_thresh=self.stale_thresh,
+            tick_period_s, pot_empty_thresh_g, stale_thresh_s, history_length_s
         )
-        self._online = False
-
-    @property
-    def online(self):
-        """Get online status (True or False)"""
-        return self._online
-
-    @online.setter
-    def online(self, value):
-        """
-        Set online status (True or False).
-        If online, hide the meter and show coffee progress bar.
-        If offline, show the meter and replace progress bar with offline msg.
-        """
-        if self._online and not value:
-            self._online = False
-            self.disp.offline()
-        elif not self._online and value:
-            self._online = True
-            self.disp.online()
+        self.pot_tare_g = pot_tare_g
+        self.tick_period_s = tick_period_s
 
     def poll_scale(self):
         """
@@ -474,27 +487,95 @@ class Brewcop:
 
     def tick(self):
         """
-        urwid's event loop calls this function on tick_period intervals.
-        Read the scale, then update the meter and the progress bar.
-        Switch online mode depending on weight reading.
+        urwid's event loop calls this function on tick_period_s intervals.
+        Read the scale, switch online mode depending on weight reading.
+        If online, update progress bar and offload brewing/ready heuristic
+        to the Brains class.
         """
         self.poll_scale()
         if self.scale.weight_is_valid:
             w = self.scale.weight - self.pot_tare_g
             if w < 0:
-                self.online = False
+                self.disp.offline()
             else:
                 self.disp.progress(w)
-                self.online = True
+                self.disp.online()
                 self.brains.store(w)
         self.disp.headC = self.brains.display
 
     def run(self):
         """Enter urwid's event loop.  Start ticker and handle input"""
-        self.disp.run(self.tick, self.tick_period)
+        self.disp.run(self.tick, self.tick_period_s)
 
 
-brewcop = Brewcop()
+"""
+Parse command line arguments.
+Default parameters are for Technivorm Moccamaster insulated carafe
+and scale on direct attached serial port of Raspberry Pi 2.
+"""
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument(
+    "--device",
+    metavar="PATH",
+    default="/dev/ttyAMA0",
+    help="Use PATH as serial device connected to scale",
+)
+parser.add_argument(
+    "--capacity",
+    metavar="N",
+    default=1250,
+    type=int,
+    help="Set capacity of coffee pot (mL)",
+)
+parser.add_argument(
+    "--tare",
+    metavar="N",
+    default=796,
+    type=int,
+    help="Set weight of empty coffee pot (g)",
+)
+parser.add_argument(
+    "--empty",
+    metavar="N",
+    default=50,
+    type=int,
+    help="Set residual coffee limit in empty pot (mL)",
+)
+parser.add_argument(
+    "--stale",
+    metavar="N",
+    default=3600 * 4,
+    type=int,
+    help="Set coffee age when it is considered stale (sec)",
+)
+parser.add_argument(
+    "--tick-period",
+    metavar="N",
+    default=0.5,
+    type=float,
+    help="Set scale polling period (sec)",
+)
+parser.add_argument(
+    "--history",
+    metavar="N",
+    default=30,
+    type=int,
+    help="Set time to keep scale history (sec)",
+)
+
+options = parser.parse_args()
+
+brewcop = Brewcop(
+    path_serial=options.device,
+    pot_capacity_mL=options.capacity,
+    pot_tare_g=options.tare,
+    pot_empty_thresh_g=options.empty,
+    stale_thresh_s=options.stale,
+    tick_period_s=options.tick_period,
+    history_length_s=options.history,
+)
 brewcop.run()
 
 # vim: tabstop=4 shiftwidth=4 expandtab
